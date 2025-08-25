@@ -1,0 +1,17 @@
+2025-08-25 14:07:10,565 - INFO - === Начало работы транспортного оптимизатора ===
+2025-08-25 14:07:10,565 - INFO - Загрузка входных данных...
+2025-08-25 14:07:10,772 - INFO - Создание переменных...
+2025-08-25 14:07:10,893 - INFO - Формирование целевой функции...
+2025-08-25 14:07:11,016 - INFO - Добавление ограничений...
+2025-08-25 14:07:11,119 - INFO - Решение модели...
+2025-08-25 14:07:11,650 - INFO - Статус решения: OPTIMAL
+2025-08-25 14:07:11,650 - INFO - Время решения: 0.50 сек
+2025-08-25 14:07:11,650 - INFO - Значение целевой функции: -3381208793102.00
+2025-08-25 14:07:11,673 - INFO - Сохранен план перевозок (648 записей)
+2025-08-25 14:07:11,673 - ERROR - Ошибка: 'float' object has no attribute 'solution_value'
+Traceback (most recent call last):
+  File "C:\Users\Professional\PycharmProjects\transportation\ORTools2.py", line 327, in main
+    save_results(solver, status, solve_time, data, x, u, v, penalty_unplaced)
+  File "C:\Users\Professional\PycharmProjects\transportation\ORTools2.py", line 267, in save_results
+    if var.solution_value() > 1e-6:
+AttributeError: 'float' object has no attribute 'solution_value'
