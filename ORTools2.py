@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re
 from ortools.linear_solver import pywraplp
+from collections import defaultdict
 
 def setup_logging():
     """Настройка системы логирования"""
@@ -102,13 +103,18 @@ def load_data():
     if 'DUMMY' not in data['warehouses']:
         data['warehouses'].append('DUMMY')
         for w in data['weeks']:
-            data['capacity'][('DUMMY', w)] = 1e9
+            data['capacity'][('DUMMY', w)] = 1e12
             data['demand'][('DUMMY', w)] = 0
         data['penalty']['DUMMY'] = 0
         max_cost = max(data['costs'].values()) if data['costs'] else 1000
         for i in data['factories']:
-            data['costs'][(i, 'DUMMY')] = max_cost * 10
-        logging.info("Добавлен фиктивный склад DUMMY для обработки неразмещённой продукции")
+            data['costs'][(i, 'DUMMY')] = max_cost
+        logging.info("Добавлен фиктивный склад DUMMY для обработки излишков")
+
+    for j in data['warehouses']:
+        for w in data['weeks']:
+            if (j, w) not in data['demand']:
+                data['demand'][(j, w)] = 0
 
     demand_weeks = set(w for _, w in data['demand'].keys())
     capacity_weeks = set(w for _, w in data['capacity'].keys())
@@ -125,9 +131,11 @@ def check_capacity(production_df, capacity_df, weeks_df):
     total_capacity = capacity_df.groupby('week')['capacity'].sum()
     for week in weeks_df['week']:
         prod = total_production.get(week, 0)
-        cap = total_capacity.get(week, 0)
+        cap = total_capacity.get(week, 0) + 1e12
         if prod > cap:
-            logging.warning(f"Неделя {week}: Производство {prod} > Вместимость {cap} (дефицит {prod - cap})")
+            logging.error(f"Неделя {week}: Производство {prod} > Вместимость {cap} (дефицит {prod - cap})")
+        else:
+            logging.info(f"Неделя {week}: Производство {prod} <= Вместимость {cap}")
 
 def check_balance(production_df, demand_df, weeks_df):
     total_production = production_df.groupby('week')['amount'].sum()
@@ -136,7 +144,7 @@ def check_balance(production_df, demand_df, weeks_df):
         prod = total_production.get(week, 0)
         dem = total_demand.get(week, 0)
         if prod > dem:
-            logging.warning(f"Неделя {week}: Производство {prod} > Общий спрос {dem} (избыток {prod - dem})")
+            logging.info(f"Неделя {week}: Производство {prod} > Общий спрос {dem} (избыток {prod - dem})")
         elif prod < dem:
             logging.warning(f"Неделя {week}: Производство {prod} < Общий спрос {dem} (дефицит {dem - prod})")
 
@@ -145,75 +153,79 @@ def create_model(data):
     if not solver:
         raise Exception("Не удалось создать решатель SCIP")
 
-    x = {}
+    x_vals = defaultdict()
+    stock = defaultdict()
     logging.info("Создание переменных...")
     for (i, j) in data['costs'].keys():
         for p in data['products']:
             for w in data['weeks']:
-                x[(i, j, p, w)] = solver.NumVar(0, solver.infinity(), f'x_{i}_{j}_{p}_{w}')
+                x_vals[(i, j, p, w)] = solver.NumVar(0, solver.infinity(), f'x_{i}_{j}_{p}_{w}')
+    for j in data['warehouses']:
+        for p in data['products']:
+            for w in data['weeks']:
+                stock[(j, p, w)] = solver.NumVar(0, solver.infinity(), f'stock_{j}_{p}_{w}')
 
     logging.info("Формирование целевой функции...")
     objective = solver.Objective()
     for (i, j), cost in data['costs'].items():
         for p in data['products']:
             for w in data['weeks']:
-                if (i, j, p, w) in x:
-                    objective.SetCoefficient(x[(i, j, p, w)], cost)
+                if (i, j, p, w) in x_vals:
+                    objective.SetCoefficient(x_vals[(i, j, p, w)], cost)
 
     for j in data['warehouses']:
         if j in data['penalty']:
             for w in data['weeks']:
-                if (j, w) in data['demand']:
+                if (j, w) in data['demand'] and data['demand'][(j, w)] > 0:
                     for i in data['factories']:
                         for p in data['products']:
-                            if (i, j, p, w) in x:
-                                current_coeff = objective.GetCoefficient(x[(i, j, p, w)])
-                                objective.SetCoefficient(x[(i, j, p, w)], current_coeff - data['penalty'][j])
-
-    penalty_unplaced = max(data['penalty'].values()) * 1000 if data['penalty'] else 1000
-    for i in data['factories']:
-        for p in data['products']:
-            for w in data['weeks']:
-                if (i, p, w) in data['production']:
-                    for j in data['warehouses']:
-                        if (i, j, p, w) in x:
-                            current_coeff = objective.GetCoefficient(x[(i, j, p, w)])
-                            objective.SetCoefficient(x[(i, j, p, w)], current_coeff - penalty_unplaced)
+                            if (i, j, p, w) in x_vals:
+                                current_coeff = objective.GetCoefficient(x_vals[(i, j, p, w)])
+                                objective.SetCoefficient(x_vals[(i, j, p, w)], current_coeff - data['penalty'][j])
 
     objective.SetMinimization()
-    full_production=0
+
     logging.info("Добавление ограничений...")
+    # Ограничение на производство: вся продукция должна быть распределена
     for i in data['factories']:
         for p in data['products']:
             for w in data['weeks']:
                 if (i, p, w) in data['production']:
-                    constraint = solver.Constraint(0, data['production'][(i, p, w)], f"Production_{i}_{p}_{w}")
-                    full_production+=data['production'][(i, p, w)]
+                    constraint = solver.Constraint(data['production'][(i, p, w)], data['production'][(i, p, w)], f"Production_{i}_{p}_{w}")
                     for j in data['warehouses']:
-                        if (i, j, p, w) in x:
-                            constraint.SetCoefficient(x[(i, j, p, w)], 1)
+                        if (i, j, p, w) in x_vals:
+                            constraint.SetCoefficient(x_vals[(i, j, p, w)], 1)
 
+    # Ограничение на вместимость: учитываем отгрузки и спрос
     for j in data['warehouses']:
         for w in data['weeks']:
             if (j, w) in data['capacity']:
-                constraint = solver.Constraint(0, data['capacity'][(j, w)], f"Capacity_{j}_{w}")
+                constraint = solver.Constraint(0, data['capacity'][(j, w)] + data['demand'].get((j, w), 0), f"Capacity_{j}_{w}")
+                for p in data['products']:
+                    if (j, p, w) in stock:
+                        constraint.SetCoefficient(stock[(j, p, w)], 1)
+                    for i in data['factories']:
+                        if (i, j, p, w) in x_vals:
+                            constraint.SetCoefficient(x_vals[(i, j, p, w)], 1)
+
+    # Баланс запасов
+    for j in data['warehouses']:
+        for p in data['products']:
+            for w in data['weeks']:
+                week_idx = data['weeks'].index(w)
+                constraint = solver.Constraint(0, 0, f"Stock_Balance_{j}_{p}_{w}")
                 for i in data['factories']:
-                    for p in data['products']:
-                        if (i, j, p, w) in x:
-                            constraint.SetCoefficient(x[(i, j, p, w)], 1)
-    full_demand=0
-    for w in data['weeks']:
-        total_demand = sum(data['demand'].get((j, w), 0) for j in data['warehouses'] if (j, w) in data['demand'])
-        full_demand+=total_demand
-        if total_demand > 0:
-            constraint = solver.Constraint(0, total_demand, f"Total_Demand_{w}")
-            for j in data['warehouses']:
-                for i in data['factories']:
-                    for p in data['products']:
-                        if (i, j, p, w) in x:
-                            constraint.SetCoefficient(x[(i, j, p, w)], 1)
-    logging.info(f"Общий спрос: {full_demand}")
-    logging.info(f'Общее производство {full_production}')
+                    if (i, j, p, w) in x_vals:
+                        constraint.SetCoefficient(x_vals[(i, j, p, w)], 1)
+                if (j, p, w) in stock:
+                    constraint.SetCoefficient(stock[(j, p, w)], -1)
+                if week_idx > 0:
+                    prev_w = data['weeks'][week_idx - 1]
+                    if (j, p, prev_w) in stock:
+                        constraint.SetCoefficient(stock[(j, p, prev_w)], 1)
+                if (j, w) in data['demand'] and data['demand'][(j, w)] > 0:
+                    constraint.SetCoefficient(stock[(j, p, w)], -data['demand'][(j, w)] / len(data['products']))
+
     logging.info("Решение модели...")
     solver.SetTimeLimit(7200 * 1000)
     solver.EnableOutput()
@@ -227,19 +239,34 @@ def create_model(data):
     if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
         for w in data['weeks']:
             total_demand = sum(data['demand'].get((j, w), 0) for j in data['warehouses'] if (j, w) in data['demand'])
-            total_load = sum(x[(i, j, p, w)].solution_value() for i in data['factories'] for j in data['warehouses'] for p in data['products'] if (i, j, p, w) in x)
+            total_load = sum(x_vals[(i, j, p, w)].solution_value() for i in data['factories'] for j in data['warehouses'] for p in data['products'] if (i, j, p, w) in x_vals)
             u[w] = max(0, total_demand - total_load)
 
         for i in data['factories']:
             for p in data['products']:
                 for w in data['weeks']:
                     if (i, p, w) in data['production']:
-                        sum_x = sum(x[(i, j, p, w)].solution_value() for j in data['warehouses'] if (i, j, p, w) in x)
+                        sum_x = sum(x_vals[(i, j, p, w)].solution_value() for j in data['warehouses'] if (i, j, p, w) in x_vals)
                         v[(i, p, w)] = data['production'][(i, p, w)] - sum_x
 
-    return solver, status, solve_time, x, u, v, penalty_unplaced
+    return solver, status, solve_time, x_vals, stock, u, v
 
-def save_results(solver, status, solve_time, data, x, u, v, penalty_unplaced):
+def sanitize_filename(name):
+    """Очистка имени файла от недопустимых символов"""
+    # Удаляем или заменяем недопустимые символы
+    invalid_chars = r'[<>:"/\\|?*\x00-\x1F]'  # Обновлённый шаблон для Windows
+    sanitized = re.sub(invalid_chars, '_', name)
+    # Удаляем множественные подчёркивания
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Удаляем пробелы в начале и конце, а также точки
+    sanitized = sanitized.strip().strip('.')
+    # Если имя пустое или начинается с подчёркивания, добавляем префикс
+    if not sanitized or sanitized.startswith('_'):
+        sanitized = f"entity_{sanitized}"
+    # Ограничиваем длину имени файла (например, до 100 символов)
+    sanitized = sanitized[:100]
+    return sanitized
+def save_results(solver, status, solve_time, data, x_val, stock, u, v):
     status_dict = {
         pywraplp.Solver.OPTIMAL: 'OPTIMAL',
         pywraplp.Solver.FEASIBLE: 'FEASIBLE',
@@ -255,7 +282,7 @@ def save_results(solver, status, solve_time, data, x, u, v, penalty_unplaced):
 
     if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
         transport_plan = []
-        for (i, j, p, w), var in x.items():
+        for (i, j, p, w), var in x_val.items():
             if var.solution_value() > 1e-6:
                 transport_plan.append({
                     'week': f"W{w}",
@@ -268,11 +295,26 @@ def save_results(solver, status, solve_time, data, x, u, v, penalty_unplaced):
         pd.DataFrame(transport_plan).to_csv('transport_plan_ortools.csv', index=False)
         logging.info(f"Сохранен план перевозок ({len(transport_plan)} записей)")
 
+        stock_plan = []
+        for (j, p, w), var in stock.items():
+            if var.solution_value() > 1e-6:
+                stock_plan.append({
+                    'week': f"W{w}",
+                    'warehouse': j,
+                    'product': p,
+                    'stock': var.solution_value()
+                })
+
+        if stock_plan:
+            pd.DataFrame(stock_plan).to_csv('stock_plan_ortools.csv', index=False)
+            logging.info(f"Сохранен план запасов ({len(stock_plan)} записей)")
+
         unsatisfied = []
         for w in data['weeks']:
             if w in u and u[w] > 1e-6:
                 total_demand = sum(data['demand'].get((j, w), 0) for j in data['warehouses'])
-                avg_penalty = sum(data['penalty'].get(j, 0) for j in data['warehouses']) / len(data['warehouses']) if data['warehouses'] else 0
+                avg_penalty = sum(data['penalty'].get(j, 0) for j in data['warehouses']) / len(data['warehouses']) if \
+                data['warehouses'] else 0
                 unsatisfied.append({
                     'week': f"W{w}",
                     'total_demand': total_demand,
@@ -293,29 +335,28 @@ def save_results(solver, status, solve_time, data, x, u, v, penalty_unplaced):
                     'product': p,
                     'week': f"W{w}",
                     'production': data['production'][(i, p, w)],
-                    'unplaced': value,
-                    'penalty': value * penalty_unplaced
+                    'unplaced': value
                 })
 
         total_unplaced = sum(v.values())
         if total_unplaced > 1e-6:
             pd.DataFrame(unplaced).to_csv('unplaced_production_ortools.csv', index=False)
             logging.error(f"Общий неразмещенный объем: {total_unplaced:.2f}")
+        else:
+            logging.info("Вся продукция успешно распределена по складам")
 
         transport_cost = 0.0
         for (i, j), cost in data['costs'].items():
             for p in data['products']:
                 for w in data['weeks']:
-                    if (i, j, p, w) in x:
-                        transport_cost += cost * x[(i, j, p, w)].solution_value()
+                    if (i, j, p, w) in x_val:
+                        transport_cost += cost * x_val[(i, j, p, w)].solution_value()
 
         unsatisfied_penalty = sum(item['penalty'] for item in unsatisfied)
-        unplaced_penalty = sum(item['penalty'] for item in unplaced)
-        total_cost = transport_cost + unsatisfied_penalty + unplaced_penalty
+        total_cost = transport_cost + unsatisfied_penalty
 
         logging.info(f"Транспортные затраты: {transport_cost:.2f}")
         logging.info(f"Штраф за неудовлетворенный спрос: {unsatisfied_penalty:.2f}")
-        logging.info(f"Штраф за неразмещенную продукцию: {unplaced_penalty:.2f}")
         logging.info(f"Общие затраты: {total_cost:.2f}")
 
         total_production = sum(data['production'].values())
@@ -324,48 +365,108 @@ def save_results(solver, status, solve_time, data, x, u, v, penalty_unplaced):
         logging.info("\n=== Сводная статистика ===")
         logging.info(f"Всего произведено: {total_production:.2f}")
         logging.info(f"Всего размещено: {total_placed:.2f}")
-        logging.info(f"Остатки на фабриках: {total_unplaced:.2f}")
-        logging.info(f"Процент удовлетворенного спроса: {(1 - total_unsatisfied / total_demand if total_demand > 0 else 1) * 100:.2f}%")
-        logging.info(f"Процент размещенной продукции: {(1 - total_unplaced / total_production if total_production > 0 else 1) * 100:.2f}%")
+        logging.info(
+            f"Процент удовлетворенного спроса: {(1 - total_unsatisfied / total_demand if total_demand > 0 else 1) * 100:.2f}%")
+        logging.info(
+            f"Процент размещенной продукции: {(1 - total_unplaced / total_production if total_production > 0 else 1) * 100:.2f}%")
 
         if not os.path.exists('plots'):
             os.makedirs('plots')
 
         try:
-            weeks_labels = [f"W{w}" for w in data['weeks']]
-            total_demand_data = [sum(data['demand'].get((j, w), 0) for j in data['warehouses']) for w in data['weeks']]
-            total_load_data = [sum(x[(i, j, p, w)].solution_value() for i in data['factories'] for j in data['warehouses'] for p in data['products'] if (i, j, p, w) in x) for w in data['weeks']]
-            total_production_data = [sum(data['production'].get((i, p, w), 0) for i in data['factories'] for p in data['products']) for w in data['weeks']]
-
-            logging.info(f"График спроса, удовлетворенного спроса и производства: недели={weeks_labels}, len(недели)={len(weeks_labels)}, total_demand_data={total_demand_data}, len(total_demand_data)={len(total_demand_data)}, total_load_data={total_load_data}, len(total_load_data)={len(total_load_data)}, total_production_data={total_production_data}, len(total_production_data)={len(total_production_data)}")
-
-            if len(total_demand_data) != len(weeks_labels) or len(total_load_data) != len(weeks_labels) or len(total_production_data) != len(weeks_labels):
-                logging.error(f"Несоответствие размеров для графика: len(weeks)={len(weeks_labels)}, len(total_demand_data)={len(total_demand_data)}, len(total_load_data)={len(total_load_data)}, len(total_production_data)={len(total_production_data)}")
-            else:
+            transport_df = pd.DataFrame(transport_plan)
+            stock_df = pd.DataFrame(stock_plan)
+            for j in data['warehouses']:
+                if j == 'DUMMY':  # Пропускаем DUMMY склад
+                    continue
                 plt.figure(figsize=(12, 6))
+
+                # Убедимся, что длина всех массивов одинаковая
+                weeks_labels = [f"W{w}" for w in data['weeks']]
                 x = np.arange(len(weeks_labels))
-                width = 0.3
-                plt.bar(x - width, total_demand_data, width, label='Total Demand', color='#FF00FF')
-                plt.bar(x, total_load_data, width, label='Satisfied Demand', color='#36A2EB')
-                plt.bar(x + width, total_production_data, width, label='Total Production', color='#4BC0C0')
+
+                # Вместимость
+                capacity_data = [data['capacity'].get((j, w), 0) for w in data['weeks']]
+                logging.info(f"Warehouse: {j}")
+                logging.info(f"x: {len(x)}")
+                logging.info(f"capacity_data: {len(capacity_data)}")
+
+                # Преобразование: убедимся, что размеры совпадают
+                if len(x) != len(capacity_data):
+                    capacity_data = capacity_data[:len(x)]  # Подгоняем длину
+
+                plt.plot(x, capacity_data, label='Capacity', color='black', linestyle='--', linewidth=2)
+
+                # Запасы на начало недели
+                initial_stock_data = []
+                for w in data['weeks']:
+                    week_idx = data['weeks'].index(w)
+                    if week_idx == 0:
+                        initial_stock_data.append(0)  # Нет запасов на начало первой недели
+                    else:
+                        prev_w = data['weeks'][week_idx - 1]
+                        initial_stock = sum(
+                            stock[(j, p, prev_w)].solution_value() for p in data['products'] if (j, p, prev_w) in stock)
+                        initial_stock_data.append(initial_stock)
+                print(f'Initial stock data {len(initial_stock_data)}')
+                # Убедимся, что размеры массивов совпадают
+                if len(x) != len(initial_stock_data):
+                    initial_stock_data = initial_stock_data[:len(x)]  # Подгоняем длину
+
+                plt.bar(x - 0.3, initial_stock_data, width=0.2, label='Initial Stock', color='#FF9999')
+
+                # Отгруженный объем
+                shipped_data = []
+                for w in data['weeks']:
+                    print(w)
+                    shipped = 0  # Инициализация переменной для отгруженного объема на текущую неделю
+                    for i in data['factories']:
+                        print(i)
+                        for p in data['products']:
+                            print(p)
+                            key = (i, j, p, w)
+                            print(key)
+                            if key in x_val:  # Проверка наличия ключа в словаре
+                                print(type(x_val[key]))
+                                shipped += x_val[key].solution_value()
+                                print(f"Шиппинг для (i={i}, j={j}, p={p}, w={w}): {x_val[key].solution_value()}")
+                            else:
+                                print(f"Нет данных для ключа: {key}")
+                    shipped_data.append(shipped)
+                    print(f"Общий отгруженный объем на неделю {w}: {shipped}")
+                # Убедимся, что размеры массивов совпадают
+                if len(x) != len(shipped_data):
+                    shipped_data = shipped_data[:len(x)]  # Подгоняем длину
+
+                plt.bar(x - 0.1, shipped_data, width=0.2, label='Shipped Volume', color='#66B2FF')
+
+                # Спрос
+                demand_data = [data['demand'].get((j, w), 0) for w in data['weeks']]
+
+                # Убедимся, что размеры массивов совпадают
+                if len(x) != len(demand_data):
+                    demand_data = demand_data[:len(x)]  # Подгоняем длину
+
+                plt.bar(x + 0.1, demand_data, width=0.2, label='Demand', color='#99FF99')
+
                 plt.xlabel('Week')
                 plt.ylabel('Volume')
-                plt.title('Total Demand, Satisfied Demand, and Production by Week')
+                plt.title(f'Warehouse {j} Load: Capacity, Initial Stock, Shipped, and Demand')
                 plt.xticks(x[::4], weeks_labels[::4], rotation=45)
                 plt.legend()
-                plt.grid(True, axis='y', linestyle='--', alpha=0.7)
-                plt.tight_layout()
-                try:
-                    plt.savefig('plots/total_demand_satisfied_production.png')
-                    logging.info("Сохранён график спроса, удовлетворенного спроса и производства: plots/total_demand_satisfied_production.png")
-                except Exception as e:
-                    logging.error(f"Ошибка при сохранении графика спроса, удовлетворенного спроса и производства: {str(e)}")
-                plt.close()
-        except Exception as e:
-            logging.error(f"Ошибка при создании графика спроса, удовлетворенного спроса и производства: {str(e)}")
+                plt.grid(True)
 
-    else:
-        raise Exception(f"Не удалось найти решение. Статус: {status_str}")
+                # Сохранение графика
+                plt.tight_layout()
+                sanitized_file_name = sanitize_filename(j)
+                plt.savefig(f'plots/warehouse_{sanitized_file_name}_load.png')
+                plt.close()
+
+            logging.info(f"Графики для складов сохранены в папку 'plots'.")
+
+        except Exception as e:
+            logging.error(f"Ошибка при создании графиков загруженности складов: {str(e)}")
+
 
 def main():
     log_file = setup_logging()
@@ -373,8 +474,9 @@ def main():
 
     try:
         data = load_data()
-        solver, status, solve_time, x, u, v, penalty_unplaced = create_model(data)
-        save_results(solver, status, solve_time, data, x, u, v, penalty_unplaced)
+        solver, status, solve_time, x, stock, u, v = create_model(data)
+
+        save_results(solver, status, solve_time, data, x, stock, u, v)
         logging.info("Оптимизация завершена успешно!")
     except Exception as e:
         logging.error(f"Ошибка: {str(e)}", exc_info=True)
