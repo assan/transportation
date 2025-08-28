@@ -114,7 +114,7 @@ def load_data():
     for j in data['warehouses']:
         for w in data['weeks']:
             if (j, w) not in data['demand']:
-                data['demand'][(j, w)] = 0
+                data['demand'][('j', 'w')] = 0
 
     demand_weeks = set(w for _, w in data['demand'].keys())
     capacity_weeks = set(w for _, w in data['capacity'].keys())
@@ -153,8 +153,8 @@ def create_model(data):
     if not solver:
         raise Exception("Не удалось создать решатель SCIP")
 
-    x_vals = defaultdict()
-    stock = defaultdict()
+    x_vals = {}
+    stock = {}
     logging.info("Создание переменных...")
     for (i, j) in data['costs'].keys():
         for p in data['products']:
@@ -200,7 +200,7 @@ def create_model(data):
     for j in data['warehouses']:
         for w in data['weeks']:
             if (j, w) in data['capacity']:
-                constraint = solver.Constraint(0, data['capacity'][(j, w)] + data['demand'].get((j, w), 0), f"Capacity_{j}_{w}")
+                constraint = solver.Constraint(0, data['capacity'][(j, w)], f"Capacity_{j}_{w}")
                 for p in data['products']:
                     if (j, p, w) in stock:
                         constraint.SetCoefficient(stock[(j, p, w)], 1)
@@ -251,21 +251,6 @@ def create_model(data):
 
     return solver, status, solve_time, x_vals, stock, u, v
 
-def sanitize_filename(name):
-    """Очистка имени файла от недопустимых символов"""
-    # Удаляем или заменяем недопустимые символы
-    invalid_chars = r'[<>:"/\\|?*\x00-\x1F]'  # Обновлённый шаблон для Windows
-    sanitized = re.sub(invalid_chars, '_', name)
-    # Удаляем множественные подчёркивания
-    sanitized = re.sub(r'_+', '_', sanitized)
-    # Удаляем пробелы в начале и конце, а также точки
-    sanitized = sanitized.strip().strip('.')
-    # Если имя пустое или начинается с подчёркивания, добавляем префикс
-    if not sanitized or sanitized.startswith('_'):
-        sanitized = f"entity_{sanitized}"
-    # Ограничиваем длину имени файла (например, до 100 символов)
-    sanitized = sanitized[:100]
-    return sanitized
 def save_results(solver, status, solve_time, data, x_val, stock, u, v):
     status_dict = {
         pywraplp.Solver.OPTIMAL: 'OPTIMAL',
@@ -313,8 +298,7 @@ def save_results(solver, status, solve_time, data, x_val, stock, u, v):
         for w in data['weeks']:
             if w in u and u[w] > 1e-6:
                 total_demand = sum(data['demand'].get((j, w), 0) for j in data['warehouses'])
-                avg_penalty = sum(data['penalty'].get(j, 0) for j in data['warehouses']) / len(data['warehouses']) if \
-                data['warehouses'] else 0
+                avg_penalty = sum(data['penalty'].get(j, 0) for j in data['warehouses']) / len(data['warehouses']) if data['warehouses'] else 0
                 unsatisfied.append({
                     'week': f"W{w}",
                     'total_demand': total_demand,
@@ -365,10 +349,8 @@ def save_results(solver, status, solve_time, data, x_val, stock, u, v):
         logging.info("\n=== Сводная статистика ===")
         logging.info(f"Всего произведено: {total_production:.2f}")
         logging.info(f"Всего размещено: {total_placed:.2f}")
-        logging.info(
-            f"Процент удовлетворенного спроса: {(1 - total_unsatisfied / total_demand if total_demand > 0 else 1) * 100:.2f}%")
-        logging.info(
-            f"Процент размещенной продукции: {(1 - total_unplaced / total_production if total_production > 0 else 1) * 100:.2f}%")
+        logging.info(f"Процент удовлетворенного спроса: {(1 - total_unsatisfied / total_demand if total_demand > 0 else 1) * 100:.2f}%")
+        logging.info(f"Процент размещенной продукции: {(1 - total_unplaced / total_production if total_production > 0 else 1) * 100:.2f}%")
 
         if not os.path.exists('plots'):
             os.makedirs('plots')
@@ -387,54 +369,42 @@ def save_results(solver, status, solve_time, data, x_val, stock, u, v):
 
                 # Вместимость
                 capacity_data = [data['capacity'].get((j, w), 0) for w in data['weeks']]
-                logging.info(f"Warehouse: {j}")
-                logging.info(f"x: {len(x)}")
-                logging.info(f"capacity_data: {len(capacity_data)}")
-
-                # Преобразование: убедимся, что размеры совпадают
+                logging.info(f"Warehouse: {j}, Capacity data length: {len(capacity_data)}")
                 if len(x) != len(capacity_data):
                     capacity_data = capacity_data[:len(x)]  # Подгоняем длину
 
                 plt.plot(x, capacity_data, label='Capacity', color='black', linestyle='--', linewidth=2)
 
-                # Запасы на начало недели
+                # Запасы на начало недели с отладкой
                 initial_stock_data = []
                 for w in data['weeks']:
                     week_idx = data['weeks'].index(w)
                     if week_idx == 0:
-                        initial_stock_data.append(0)  # Нет запасов на начало первой недели
+                        initial_stock = 0  # Нет запасов на начало первой недели
                     else:
                         prev_w = data['weeks'][week_idx - 1]
-                        initial_stock = sum(
-                            stock[(j, p, prev_w)].solution_value() for p in data['products'] if (j, p, prev_w) in stock)
-                        initial_stock_data.append(initial_stock)
-                print(f'Initial stock data {len(initial_stock_data)}')
-                # Убедимся, что размеры массивов совпадают
-                if len(x) != len(initial_stock_data):
-                    initial_stock_data = initial_stock_data[:len(x)]  # Подгоняем длину
+                        initial_stock = 0
+                        for p in data['products']:
+                            key = (j, p, prev_w)
+                            if key in stock:
+                                initial_stock += stock[key].solution_value()
+                        logging.info(f"Warehouse {j}, Week {prev_w} -> Initial Stock: {initial_stock}")
+                    initial_stock_data.append(initial_stock)
+                logging.info(f"Initial Stock data for {j}: {initial_stock_data}")
 
                 plt.bar(x - 0.3, initial_stock_data, width=0.2, label='Initial Stock', color='#FF9999')
 
                 # Отгруженный объем
                 shipped_data = []
                 for w in data['weeks']:
-                    print(w)
-                    shipped = 0  # Инициализация переменной для отгруженного объема на текущую неделю
+                    shipped = 0
                     for i in data['factories']:
-                        print(i)
                         for p in data['products']:
-                            print(p)
                             key = (i, j, p, w)
-                            print(key)
-                            if key in x_val:  # Проверка наличия ключа в словаре
-                                print(type(x_val[key]))
+                            if key in x_val:
                                 shipped += x_val[key].solution_value()
-                                print(f"Шиппинг для (i={i}, j={j}, p={p}, w={w}): {x_val[key].solution_value()}")
-                            else:
-                                print(f"Нет данных для ключа: {key}")
                     shipped_data.append(shipped)
-                    print(f"Общий отгруженный объем на неделю {w}: {shipped}")
-                # Убедимся, что размеры массивов совпадают
+                    logging.info(f"Warehouse {j}, Week {w}, Shipped: {shipped}")
                 if len(x) != len(shipped_data):
                     shipped_data = shipped_data[:len(x)]  # Подгоняем длину
 
@@ -442,12 +412,23 @@ def save_results(solver, status, solve_time, data, x_val, stock, u, v):
 
                 # Спрос
                 demand_data = [data['demand'].get((j, w), 0) for w in data['weeks']]
-
-                # Убедимся, что размеры массивов совпадают
                 if len(x) != len(demand_data):
                     demand_data = demand_data[:len(x)]  # Подгоняем длину
 
                 plt.bar(x + 0.1, demand_data, width=0.2, label='Demand', color='#99FF99')
+
+                # Проверка баланса запасов (для отладки)
+                end_stock_data = []
+                for w_idx, w in enumerate(data['weeks']):
+                    if w_idx == 0:
+                        end_stock = shipped_data[w_idx] - demand_data[w_idx] / len(data['products'])
+                    else:
+                        end_stock = initial_stock_data[w_idx] + shipped_data[w_idx] - demand_data[w_idx] / len(data['products'])
+                    end_stock_data.append(max(0, end_stock))  # Ограничение неотрицательности
+                    actual_stock = sum(stock.get((j, p, w), None).solution_value() if (j, p, w) in stock else 0 for p in
+                                       data['products'])
+                    logging.info(
+                        f"Warehouse {j}, Week {w}, Calculated End Stock: {end_stock}, Actual Stock: {actual_stock}")
 
                 plt.xlabel('Week')
                 plt.ylabel('Volume')
@@ -455,8 +436,6 @@ def save_results(solver, status, solve_time, data, x_val, stock, u, v):
                 plt.xticks(x[::4], weeks_labels[::4], rotation=45)
                 plt.legend()
                 plt.grid(True)
-
-                # Сохранение графика
                 plt.tight_layout()
                 sanitized_file_name = sanitize_filename(j)
                 plt.savefig(f'plots/warehouse_{sanitized_file_name}_load.png')
@@ -467,6 +446,8 @@ def save_results(solver, status, solve_time, data, x_val, stock, u, v):
         except Exception as e:
             logging.error(f"Ошибка при создании графиков загруженности складов: {str(e)}")
 
+    else:
+        raise Exception(f"Не удалось найти решение. Статус: {status_str}")
 
 def main():
     log_file = setup_logging()
@@ -475,7 +456,6 @@ def main():
     try:
         data = load_data()
         solver, status, solve_time, x, stock, u, v = create_model(data)
-
         save_results(solver, status, solve_time, data, x, stock, u, v)
         logging.info("Оптимизация завершена успешно!")
     except Exception as e:
